@@ -1,3 +1,10 @@
+> [!NOTE]\
+> This fork has major changes that is not aligned with upstream
+> usage documentation.
+> I.e. do not use this.
+
+---
+
 # dirigera - Manage your IKEA devices
 
 **This crate is under development and can change at any time! Do not use just

@@ -15,6 +15,8 @@ pub enum Device {
     Light(DeviceData),
     Outlet(DeviceData),
     Sensor(DeviceData),
+    #[serde(untagged)]
+    Unknown(DeviceData),
 }
 
 /// Common data that is shared between all [`Device`]s.
@@ -191,6 +193,7 @@ impl Device {
             Device::Light(inner) => inner,
             Device::Outlet(inner) => inner,
             Device::Sensor(inner) => inner,
+            Device::Unknown(inner) => inner,
         }
     }
 
@@ -203,6 +206,7 @@ impl Device {
             Device::Light(ref mut inner) => inner,
             Device::Outlet(ref mut inner) => inner,
             Device::Sensor(ref mut inner) => inner,
+            Device::Unknown(ref mut inner) => inner,
         }
     }
 }

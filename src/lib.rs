@@ -1,15 +1,41 @@
 //! Dirigera: Manger your IKEA devices.
 //! Dirigera is a client to communicate with your IKEA Dirigera hub and control your Trådfri
-//! devices. It is built with [`hyper`] and is bundled with an optional tool to generate the token
-//! you need for the communication.
-pub mod device;
-pub mod hub;
+//! devices. ~~It is built with [`hyper`] and is bundled with an optional tool to generate the token
+//! you need for the communication.~~
+mod device;
+mod hub;
 pub mod scene;
+pub mod traits;
+mod connect;
+mod config;
+mod errors;
 
-pub use device::{Device, DeviceData, DeviceType};
+pub use hub::Hub;
+pub use errors::Error;
+pub use config::Config;
+pub use connect::Connect;
+pub use device::{
+    Device,
+    DeviceData,
+    DeviceType
+};
 pub use scene::Scene;
 
+use std::sync::OnceLock;
 use serde::Deserialize;
+
+pub(crate) const DIRIGERA_PORT: u16 = 8443;
+pub(crate) const DIRIGERA_API_VERSION: &str = "v1";
+
+pub(crate) fn user_agent() -> &'static str {
+    static USER_AGENT: OnceLock<String> = OnceLock::new();
+    USER_AGENT.get_or_init(|| {
+        let version = std::env!("CARGO_PKG_VERSION");
+        let name = std::env!("CARGO_PKG_NAME");
+
+        format!("{}-rs/{}", name, version)
+    })
+}
 
 pub(crate) fn deserialize_datetime<'de, D>(
     deserializer: D,
@@ -36,34 +62,3 @@ where
     }
 }
 
-/// A module that is used to disable TLS verification. This is used because the Dirigera HUB uses
-/// HTTPS but with a self signed certificate.
-pub mod danger {
-    pub struct NoCertificateVerification;
-
-    impl rustls::client::ServerCertVerifier for NoCertificateVerification {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &rustls::Certificate,
-            _intermediates: &[rustls::Certificate],
-            _server_name: &rustls::client::ServerName,
-            _scts: &mut dyn Iterator<Item = &[u8]>,
-            _ocsp_response: &[u8],
-            _now: std::time::SystemTime,
-        ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-            Ok(rustls::client::ServerCertVerified::assertion())
-        }
-    }
-
-    pub fn tls_no_verify() -> rustls::ClientConfig {
-        let mut tls = rustls::ClientConfig::builder()
-            .with_safe_defaults()
-            .with_root_certificates(rustls::RootCertStore::empty())
-            .with_no_client_auth();
-
-        tls.dangerous()
-            .set_certificate_verifier(std::sync::Arc::new(NoCertificateVerification));
-
-        tls
-    }
-}

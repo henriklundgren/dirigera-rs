@@ -4,140 +4,108 @@
 //! TLS verification. You also need a bearer token which is obtain via OAuth 2. Configuration for
 //! TLS and tool to get a token is both available under the [`danger`](crate::danger) module and the
 //! `config` feature flag respectively.
-use hyper::service::Service;
-use serde::Deserialize;
-
+use std::net::Ipv4Addr;
 use std::collections::HashMap;
-#[cfg(feature = "config")]
-use std::io::Read;
+use reqwest::Client;
+use reqwest::header::{
+    HeaderMap,
+    HeaderValue,
+    AUTHORIZATION,
+    CONTENT_TYPE,
+};
+use url_builder::{url_builder, Part};
 
-const DIRIGERA_PORT: u16 = 8443;
-const DIRIGERA_API_VERSION: &str = "v1";
+use crate::Device;
+use crate::DIRIGERA_API_VERSION;
+use crate::DIRIGERA_PORT;
+use crate::traits::DirigeraExt;
+use crate::config::Config;
 
-/// A [`Hub`] consists of a [`hyper`] client, the hub's IP address and a token to communicate with
+/// A [`Hub`] consists of a [`reqwest`] client, and the hub's IP address to communicate with
 /// it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Hub {
-    client: hyper::Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
-    ip_address: std::net::Ipv4Addr,
-    token: String,
+    client: Client,
+    ip_address: Ipv4Addr,
 }
 
-/// If you want to read the configuration from a `toml` file, the [`Config`] is used to deserialize
-/// the file contents. It's only available behind the `config` feature flag.
-#[cfg(feature = "config")]
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "kebab-case")]
-pub struct Config {
-    ip_address: std::net::Ipv4Addr,
-    token: String,
-}
+#[async_trait::async_trait]
+impl DirigeraExt for Hub {
+    type Rejection = crate::Error;
+    type Config = Config;
+    type Device = Device;
 
-/// The default implementation for [`Hub`] can be used to read the IP address and token from a
-/// `toml` file. Such `toml` file will be created by running the `generate-token` binary. It will
-/// also use the [`danger`](crate::danger) module to setup [`rustls`] with no certification
-/// verification.
-#[cfg(feature = "config")]
-impl Default for Hub {
-    fn default() -> Self {
-        let mut toml_content = String::new();
-        std::fs::File::open("config.toml")
-            .expect("Failed to open config.toml")
-            .read_to_string(&mut toml_content)
-            .expect("Failed to read config.toml");
+    fn new(config: &Self::Config) -> Result<Self, Self::Rejection> {
+        // base_url PR https://github.com/seanmonstar/reqwest/pull/1620
+        let client = Client::builder()
+            .danger_accept_invalid_certs(true)
+            .user_agent(crate::user_agent())
+            .default_headers({
+                let mut headers = HeaderMap::new();
+                let bearer_token = format!("Bearer {}", config.token);
+                let mut auth_value = HeaderValue::from_str(&bearer_token)?;
+                auth_value.set_sensitive(true);
+                headers.insert(AUTHORIZATION, auth_value);
+                let content_type = HeaderValue::from_static("application/json");
+                headers.insert(CONTENT_TYPE, content_type);
 
-        let config: Config = toml::from_str(&toml_content).expect("Failed to parse TOML");
+                headers
+            })
+            .build()?;
 
-        let tls = crate::danger::tls_no_verify();
-        let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls)
-            .https_only()
-            .enable_http1()
-            .build();
-
-        let client = hyper::Client::builder().build::<_, hyper::Body>(https);
-
-        Self::new(client, config.ip_address, config.token)
-    }
-}
-
-impl Hub {
-    /// Create a new instance of the [`Hub`]. You need to construct your own [`hyper]` client and
-    /// use it together with the IP address and bearer token for the [`Hub`].
-    pub fn new(
-        client: hyper::Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
-        ip_address: std::net::Ipv4Addr,
-        token: String,
-    ) -> Self {
-        Hub {
+        Ok(Self {
             client,
-            ip_address,
-            token,
-        }
-    }
-
-    fn create_request(
-        &self,
-        method: http::Method,
-        path: &str,
-        body: Option<hyper::Body>,
-    ) -> anyhow::Result<http::Request<hyper::Body>> {
-        let uri: hyper::Uri = format!(
-            "https://{}:{}/{}{}",
-            self.ip_address, DIRIGERA_PORT, DIRIGERA_API_VERSION, path,
-        )
-        .try_into()?;
-
-        let request = http::Request::builder()
-            .method(method)
-            .uri(&uri)
-            .header(http::header::CONTENT_TYPE, "application/json")
-            .header("User-Agent", "dirigera-rs/0.1.0")
-            .header("Authorization", format!("Bearer {}", self.token));
-
-        let req = match body {
-            Some(body) => request.body(body),
-            None => request.body(hyper::Body::empty()),
-        };
-
-        req.map_err(|err| anyhow::anyhow!(err))
-    }
-
-    async fn deserialize_response<T>(response: http::Response<hyper::Body>) -> anyhow::Result<T>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let (_, body) = response.into_parts();
-        let body = hyper::body::to_bytes(body).await?;
-
-        serde_json::from_slice(body.as_ref()).map_err(|err| anyhow::anyhow!(err))
+            ip_address: config.ip_address,
+        })
     }
 
     /// List all devices that is known for the [`Hub`]. This will return an exhaustive list of
     /// [`Device`](crate::Device)s.
-    pub async fn devices(&mut self) -> anyhow::Result<Vec<crate::Device>> {
-        Self::deserialize_response(
-            self.client
-                .call(self.create_request(http::Method::GET, "/devices", None)?)
-                .await?,
-        )
-        .await
+    async fn list(&self) -> Result<Vec<Self::Device>, Self::Rejection> {
+        self.client
+            .get({
+                url_builder! {
+                    Part::Scheme("https");
+                    Part::HostIpv4(self.ip_address);
+                    Part::Port(DIRIGERA_PORT);
+                    Part::PathSlice(&[
+                        DIRIGERA_API_VERSION,
+                        "devices",
+                    ])
+                }?
+            })
+            .send()
+            .await?
+            .json::<Vec<Device>>()
+            .await
+            .map_err(Self::Rejection::BuildError)
     }
 
     /// Get a single [`Device`](crate::Device) based on its id.
-    pub async fn device(&mut self, id: &str) -> anyhow::Result<crate::Device> {
-        Self::deserialize_response(
-            self.client
-                .call(self.create_request(
-                    http::Method::GET,
-                    format!("/devices/{}", id).as_str(),
-                    None,
-                )?)
-                .await?,
-        )
-        .await
+    async fn get(&self, id: &str) -> Result<Self::Device, Self::Rejection> {
+        self.client
+            .get({
+                url_builder! {
+                    Part::Scheme("https");
+                    Part::HostIpv4(self.ip_address);
+                    Part::Port(DIRIGERA_PORT);
+                    Part::PathSlice(&[
+                        DIRIGERA_API_VERSION,
+                        "devices",
+                        id,
+                    ])
+                }?
+            })
+            .send()
+            .await?
+            .json::<Device>()
+            .await
+            .map_err(Self::Rejection::BuildError)
     }
 
+}
+
+impl Hub {
     /// Rename a [`Device`](crate::Device). The function takes a mutable reference to the
     /// [`Device`](crate::Device) because on successful renaming the passed
     /// [`Device`](crate::Device) will be updated with the new name.
@@ -164,12 +132,13 @@ impl Hub {
         let body: String = serde_json::to_string(&vec![body])?;
 
         self.client
-            .call(self.create_request(
-                http::Method::PATCH,
-                format!("/devices/{}", inner.id).as_str(),
-                Some(hyper::Body::from(body)),
-            )?)
-            .await?;
+            .patch({
+                make_url(self.ip_address, &format!("/devices/{}", inner.id))?
+            })
+            .body(body)
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!(err))?;
 
         inner.attributes.custom_name = new_name.to_string();
 
@@ -206,12 +175,13 @@ impl Hub {
         let body: String = serde_json::to_string(&vec![body])?;
 
         self.client
-            .call(self.create_request(
-                http::Method::PATCH,
-                format!("/devices/{}", inner.id).as_str(),
-                Some(hyper::Body::from(body)),
-            )?)
-            .await?;
+            .patch({
+                make_url(self.ip_address, &format!("/devices/{}", inner.id))?
+            })
+            .body(body)
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!(err))?;
 
         inner.attributes.is_on = inner.attributes.is_on.map(|x| !x);
 
@@ -250,12 +220,13 @@ impl Hub {
         let body: String = serde_json::to_string(&vec![body])?;
 
         self.client
-            .call(self.create_request(
-                http::Method::PATCH,
-                format!("/devices/{}", inner.id).as_str(),
-                Some(hyper::Body::from(body)),
-            )?)
-            .await?;
+            .patch({
+                make_url(self.ip_address, &format!("/devices/{}", inner.id))?
+            })
+            .body(body)
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!(err))?;
 
         inner.attributes.light_level = Some(level);
 
@@ -304,12 +275,13 @@ impl Hub {
         let body: String = serde_json::to_string(&vec![body])?;
 
         self.client
-            .call(self.create_request(
-                http::Method::PATCH,
-                format!("/devices/{}", inner.id).as_str(),
-                Some(hyper::Body::from(body)),
-            )?)
-            .await?;
+            .patch({
+                make_url(self.ip_address, &format!("/devices/{}", inner.id))?
+            })
+            .body(body)
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!(err))?;
 
         inner.attributes.color_temperature = Some(temperature);
 
@@ -359,12 +331,13 @@ impl Hub {
         let body: String = serde_json::to_string(&vec![body])?;
 
         self.client
-            .call(self.create_request(
-                http::Method::PATCH,
-                format!("/devices/{}", inner.id).as_str(),
-                Some(hyper::Body::from(body)),
-            )?)
-            .await?;
+            .patch({
+                make_url(self.ip_address, &format!("/devices/{}", inner.id))?
+            })
+            .body(body)
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!(err))?;
 
         inner.attributes.color_hue = Some(hue);
         inner.attributes.color_saturation = Some(hue);
@@ -391,12 +364,13 @@ impl Hub {
         let body: String = serde_json::to_string(&vec![body])?;
 
         self.client
-            .call(self.create_request(
-                http::Method::PATCH,
-                format!("/devices/{}", inner.id).as_str(),
-                Some(hyper::Body::from(body)),
-            )?)
-            .await?;
+            .patch({
+                make_url(self.ip_address, &format!("/devices/{}", inner.id))?
+            })
+            .body(body)
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!(err))?;
 
         inner.attributes.startup_on_off = Some(behaviour);
 
@@ -435,12 +409,13 @@ impl Hub {
         let body: String = serde_json::to_string(&vec![body])?;
 
         self.client
-            .call(self.create_request(
-                http::Method::PATCH,
-                format!("/devices/{}", inner.id).as_str(),
-                Some(hyper::Body::from(body)),
-            )?)
-            .await?;
+            .patch({
+                make_url(self.ip_address, &format!("/devices/{}", inner.id))?
+            })
+            .body(body)
+            .send()
+            .await
+            .map_err(|err| anyhow::anyhow!(err))?;
 
         inner.attributes.blinds_target_level = Some(level);
 
@@ -450,29 +425,31 @@ impl Hub {
     /// List all scenes that is known for the [`Hub`]. This will return an exhaustive list of
     /// [`Scene`](crate::Scene)s.
     pub async fn scenes(&mut self) -> anyhow::Result<Vec<crate::Scene>> {
-        Self::deserialize_response(
-            self.client
-                .call(self.create_request(http::Method::GET, "/scenes", None)?)
-                .await?,
-        )
-        .await
+        self.client
+            .get({
+                make_url(self.ip_address, "/scenes")?
+            })
+            .send()
+            .await?
+            .json::<Vec<crate::Scene>>()
+            .await
+            .map_err(|err| anyhow::anyhow!(err))
     }
 
     /// Get a single [`Scene`](crate::Scene) based on its id.
     pub async fn scene(&mut self, id: &str) -> anyhow::Result<crate::Scene> {
-        Self::deserialize_response(
-            self.client
-                .call(self.create_request(
-                    http::Method::GET,
-                    format!("/scenes/{}", id).as_str(),
-                    None,
-                )?)
-                .await?,
-        )
-        .await
+        self.client
+            .get({
+                make_url(self.ip_address, &format!("/scenes/{}", id))?
+            })
+            .send()
+            .await?
+            .json::<crate::Scene>()
+            .await
+            .map_err(|err| anyhow::anyhow!(err))
     }
 
-    /// Trigger a [`Scene`](crate::Scene) now. Will work independent of a scheduled scene or not.
+    /*/// Trigger a [`Scene`](crate::Scene) now. Will work independent of a scheduled scene or not.
     pub async fn trigger_scene(&mut self, scene: &crate::scene::Scene) -> anyhow::Result<()> {
         let inner = scene.inner();
 
@@ -485,9 +462,9 @@ impl Hub {
             .await?;
 
         Ok(())
-    }
+    }*/
 
-    /// Undo scene will revert the changes set by the [`Scene`](crate::Scene).
+    /*/// Undo scene will revert the changes set by the [`Scene`](crate::Scene).
     pub async fn undo_scene(&mut self, scene: &crate::scene::Scene) -> anyhow::Result<()> {
         let inner = scene.inner();
 
@@ -500,7 +477,19 @@ impl Hub {
             .await?;
 
         Ok(())
+    }*/
+}
+
+fn make_url(host: Ipv4Addr, path: &str) -> Result<url::Url, crate::Error> {
+    use Part::*;
+
+    url_builder! {
+        Scheme("https");
+        HostIpv4(host);
+        Port(DIRIGERA_PORT);
+        Path(&format!("{}{}", DIRIGERA_API_VERSION, path));
     }
+    .map_err(crate::Error::UrlBuilder)
 }
 
 fn has_capability(
@@ -509,3 +498,4 @@ fn has_capability(
 ) -> bool {
     required.iter().all(|item| got.contains(item))
 }
+
